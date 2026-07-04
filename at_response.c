@@ -394,7 +394,7 @@ static void log_cmd_response_error(const struct pvt* pvt, const at_queue_cmd_t *
 	va_list ap;
 	char tempbuff[512];
 
-	if (at_cmd_suppress_error_mode(ecmd->flags) == SUPPRESS_ERROR_ENABLED) {
+	if (ecmd && at_cmd_suppress_error_mode(ecmd->flags) == SUPPRESS_ERROR_ENABLED) {
 		if (DEBUG_ATLEAST(1)) {
 			ast_log(AST_LOG_DEBUG, "[%s] Command response error suppressed:\n", PVT_ID(pvt));
 			va_start(ap, fmt);
@@ -1613,6 +1613,24 @@ static int at_response_sms_prompt (struct pvt* pvt)
 	return 0;
 }
 
+static int is_ucs2_hex_string(const char *str)
+{
+	size_t len = strlen(str);
+
+	if (len == 0 || len % 4 != 0) {
+		return 0;
+	}
+
+	for (; *str; str++) {
+		if ((*str >= '0' && *str <= '9') || (*str >= 'A' && *str <= 'F') || (*str >= 'a' && *str <= 'f')) {
+			continue;
+		}
+		return 0;
+	}
+
+	return 1;
+}
+
 /*!
  * \brief Handle CUSD response
  * \param pvt -- pvt structure
@@ -1637,6 +1655,7 @@ static int at_response_cusd (struct pvt * pvt, char * str, size_t len)
 	int		type;
 	char*		cusd;
 	int		dcs;
+	int		raw_dcs;
 	char		cusd_utf8_str[1024];
 	char		text_base64[16384];
 	char		typebuf[2];
@@ -1659,6 +1678,7 @@ static int at_response_cusd (struct pvt * pvt, char * str, size_t len)
 
 	typebuf[0] = type + '0';
 	typebuf[1] = 0;
+	raw_dcs = dcs;
 
 	// sanitize DCS
 	if (dcs & 0x40) {
@@ -1669,9 +1689,21 @@ static int at_response_cusd (struct pvt * pvt, char * str, size_t len)
 	}
 
 	ast_verb (1, "[%s] USSD DCS=%d (0: gsm7, 1: ascii, 2: ucs2)\n", PVT_ID(pvt), dcs);
-	if (dcs == 0) { // GSM-7
+	if (dcs == 2 || (pvt->use_ucs2_encoding && is_ucs2_hex_string(cusd))) { // UCS-2
+		int cusd_nibbles = unhex(cusd, (uint8_t*)cusd);
+		if (cusd_nibbles < 0) {
+			return -1;
+		}
+		res = ucs2_to_utf8((const uint16_t*)cusd, (cusd_nibbles + 1) / 4, cusd_utf8_str, sizeof(cusd_utf8_str) - 1);
+		if (dcs != 2) {
+			ast_verb (1, "[%s] Treating USSD response as UCS-2 because CSCS=UCS2 (raw DCS=%d)\n", PVT_ID(pvt), raw_dcs);
+		}
+	} else if (dcs == 0) { // GSM-7
 		uint16_t out_ucs2[1024];
-		int cusd_nibbles = unhex(cusd, cusd);
+		int cusd_nibbles = unhex(cusd, (uint8_t*)cusd);
+		if (cusd_nibbles < 0) {
+			return -1;
+		}
 		res = gsm7_unpack_decode(cusd, cusd_nibbles, out_ucs2, sizeof(out_ucs2) / 2, 0, 0, 0);
 		if (res < 0) {
 			return -1;
@@ -1684,9 +1716,6 @@ static int at_response_cusd (struct pvt * pvt, char * str, size_t len)
 		} else {
 			memcpy(cusd_utf8_str, cusd, res);
 		}
-	} else if (dcs == 2) { // UCS-2
-		int cusd_nibbles = unhex(cusd, cusd);
-		res = ucs2_to_utf8((const uint16_t*)cusd, (cusd_nibbles + 1) / 4, cusd_utf8_str, sizeof(cusd_utf8_str) - 1);
 	} else {
 		res = -1;
 	}
