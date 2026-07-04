@@ -343,27 +343,42 @@ EXPORT_DEF int at_enqueue_ussd(struct cpvt *cpvt, const char *code)
 	length = STRLEN(cmd);
 	int code_len = strlen(code);
 
-	// use 7 bit encoding. 15 is 00001111 in binary and means 'Language using the GSM 7 bit default alphabet; Language unspecified' accodring to GSM 23.038
-	uint16_t code16[code_len * 2];
-	uint8_t code_packed[4069];
-	res = utf8_to_ucs2(code, code_len, code16, sizeof(code16));
+	uint16_t code16[code_len + 1];
+	res = utf8_to_ucs2(code, code_len, code16, sizeof(code16) / sizeof(code16[0]));
 	if (res < 0) {
 		chan_quectel_err = E_PARSE_UTF8;
 		return -1;
 	}
-	res = gsm7_encode(code16, res, code16);
-	if (res < 0) {
-		chan_quectel_err = E_ENCODE_GSM7;
-		return -1;
+
+	if (cpvt->pvt->use_ucs2_encoding) {
+		if (STRLEN(cmd) + res * 4 + STRLEN(cmd_end) >= sizeof(buf)) {
+			chan_quectel_err = E_UNKNOWN;
+			return -1;
+		}
+		hexify((uint8_t *)code16, res * 2, buf + STRLEN(cmd));
+		length += res * 4;
+	} else {
+		/* use 7 bit encoding. 15 is 00001111 in binary and means 'Language using the GSM 7 bit default alphabet; Language unspecified' according to GSM 23.038 */
+		char code_packed[4069];
+
+		res = gsm7_encode(code16, res, code16);
+		if (res < 0) {
+			chan_quectel_err = E_ENCODE_GSM7;
+			return -1;
+		}
+		res = gsm7_pack(code16, res, code_packed, sizeof(code_packed), 0);
+		if (res < 0) {
+			chan_quectel_err = E_PACK_GSM7;
+			return -1;
+		}
+		res = (res + 1) / 2;
+		if (STRLEN(cmd) + res * 2 + STRLEN(cmd_end) >= sizeof(buf)) {
+			chan_quectel_err = E_UNKNOWN;
+			return -1;
+		}
+		hexify((uint8_t *)code_packed, res, buf + STRLEN(cmd));
+		length += res * 2;
 	}
-	res = gsm7_pack(code16, res, code_packed, sizeof(code_packed), 0);
-	if (res < 0) {
-		chan_quectel_err = E_PACK_GSM7;
-		return -1;
-	}
-	res = (res + 1) / 2;
-	hexify(code_packed, res, buf + STRLEN(cmd));
-	length += res * 2;
 
 	memcpy(buf + length, cmd_end, STRLEN(cmd_end)+1);
 	length += STRLEN(cmd_end);
