@@ -35,6 +35,9 @@ static int dc_uconfig_fill(struct ast_config * cfg, const char * cat, struct dc_
 	const char * imsi;
 	const char * quec_uac;
 	const char * alsadev;
+	const char * audio_rate;
+	char * audio_rate_end;
+	unsigned long parsed_audio_rate;
 
 	audio_tty = ast_variable_retrieve (cfg, cat, "audio");
 	data_tty  = ast_variable_retrieve (cfg, cat, "data");
@@ -42,6 +45,7 @@ static int dc_uconfig_fill(struct ast_config * cfg, const char * cat, struct dc_
 	imsi = ast_variable_retrieve (cfg, cat, "imsi");
         quec_uac = ast_variable_retrieve (cfg, cat, "quec_uac");
         alsadev = ast_variable_retrieve (cfg, cat, "alsadev");
+	audio_rate = ast_variable_retrieve (cfg, cat, "audio_rate");
 
 	if(imei && strlen(imei) != IMEI_SIZE) {
 		ast_log (LOG_WARNING, "[%s] Ignore invalid IMEI value '%s'\n", cat, imei);
@@ -67,6 +71,26 @@ static int dc_uconfig_fill(struct ast_config * cfg, const char * cat, struct dc_
 	if((!alsadev && quec_uac) || (alsadev && !quec_uac))
 	{
 		ast_log (LOG_ERROR, "Skipping device %s. If uac is set as 1, alsa device must be specified\n", cat);
+		return 1;
+	}
+
+	config->audio_rate = 8000;
+	if (audio_rate)
+	{
+		errno = 0;
+		parsed_audio_rate = strtoul(audio_rate, &audio_rate_end, 10);
+		if (errno || *audio_rate == '\0' || *audio_rate_end != '\0' ||
+				(parsed_audio_rate != 8000 && parsed_audio_rate != 16000))
+		{
+			ast_log(LOG_ERROR, "Skipping device %s. audio_rate must be 8000 or 16000\n", cat);
+			return 1;
+		}
+		config->audio_rate = (unsigned int) parsed_audio_rate;
+	}
+
+	if (config->audio_rate == 16000 && (!quec_uac || strcmp(quec_uac, "1")))
+	{
+		ast_log(LOG_ERROR, "Skipping device %s. audio_rate=16000 requires quec_uac=1\n", cat);
 		return 1;
 	}
 

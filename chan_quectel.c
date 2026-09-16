@@ -84,6 +84,7 @@ EXPORT_DEF public_state_t *gpublic;
 #if ASTERISK_VERSION_NUM >= 100000 && ASTERISK_VERSION_NUM < 130000 /* 10-13   \
                                                                      */
 EXPORT_DEF struct ast_format chan_quectel_format;
+EXPORT_DEF struct ast_format chan_quectel_format16;
 EXPORT_DEF struct ast_format_cap *chan_quectel_format_cap;
 #endif /* ^10-13 */
 
@@ -95,9 +96,10 @@ static snd_pcm_t *alsa_card_init(char *dev, snd_pcm_stream_t stream,
   snd_pcm_hw_params_t *hwparams = NULL;
   snd_pcm_sw_params_t *swparams = NULL;
   struct pollfd pfd;
-  snd_pcm_uframes_t period_size = PERIOD_FRAMES * 4;
+  snd_pcm_uframes_t period_size = pvt_audio_frame_samples(pvt);
   snd_pcm_uframes_t buffer_size = 0;
-  unsigned int rate = DESIRED_RATE;
+  unsigned int requested_rate = pvt_audio_rate(pvt);
+  unsigned int rate = requested_rate;
   snd_pcm_uframes_t start_threshold, stop_threshold;
 
   err = snd_pcm_open(&handle, dev, stream, SND_PCM_NONBLOCK);
@@ -115,50 +117,66 @@ static snd_pcm_t *alsa_card_init(char *dev, snd_pcm_stream_t stream,
 
   err = snd_pcm_hw_params_set_access(handle, hwparams,
                                      SND_PCM_ACCESS_RW_INTERLEAVED);
-  if (err < 0)
+  if (err < 0) {
     ast_log(LOG_ERROR, "set_access failed: %s\n", snd_strerror(err));
+    goto fail;
+  }
 
   err = snd_pcm_hw_params_set_format(handle, hwparams, format);
-  if (err < 0)
+  if (err < 0) {
     ast_log(LOG_ERROR, "set_format failed: %s\n", snd_strerror(err));
+    goto fail;
+  }
 
   err = snd_pcm_hw_params_set_channels(handle, hwparams, 1);
-  if (err < 0)
+  if (err < 0) {
     ast_log(LOG_ERROR, "set_channels failed: %s\n", snd_strerror(err));
+    goto fail;
+  }
 
   direction = 0;
   err = snd_pcm_hw_params_set_rate_near(handle, hwparams, &rate, &direction);
-  if (rate != DESIRED_RATE)
-    ast_log(LOG_WARNING, "Rate not correct, requested %d, got %u\n",
-            DESIRED_RATE, rate);
+  if (err < 0 || rate != requested_rate) {
+    ast_log(LOG_ERROR, "Unable to set exact rate %u Hz on %s (got %u Hz): %s\n",
+            requested_rate, dev, rate, err < 0 ? snd_strerror(err) : "rate mismatch");
+    goto fail;
+  }
 
   direction = 0;
   err = snd_pcm_hw_params_set_period_size_near(handle, hwparams, &period_size,
                                                &direction);
-  if (err < 0)
+  if (err < 0) {
     ast_log(LOG_ERROR, "period_size(%lu frames) is bad: %s\n", period_size,
             snd_strerror(err));
-  else {
-    ast_debug(1, "Period size is %d\n", err);
+    goto fail;
+  } else {
+    ast_debug(1, "Period size is %lu frames\n", period_size);
   }
 
-  buffer_size = 4096 * 2; /* period_size * 16; */
+  buffer_size = period_size * 16;
   err = snd_pcm_hw_params_set_buffer_size_near(handle, hwparams, &buffer_size);
   if (err < 0)
     ast_log(LOG_WARNING, "Problem setting buffer size of %lu: %s\n",
             buffer_size, snd_strerror(err));
   else {
-    ast_debug(1, "Buffer size is set to %d frames\n", err);
+    ast_debug(1, "Buffer size is set to %lu frames\n", buffer_size);
   }
 
   err = snd_pcm_hw_params(handle, hwparams);
-  if (err < 0)
+  if (err < 0) {
     ast_log(LOG_ERROR, "Couldn't set the new hw params: %s\n",
             snd_strerror(err));
+    goto fail;
+  }
 
   swparams = ast_alloca(snd_pcm_sw_params_sizeof());
   memset(swparams, 0, snd_pcm_sw_params_sizeof());
-  snd_pcm_sw_params_current(handle, swparams);
+  err = snd_pcm_sw_params_current(handle, swparams);
+  if (err < 0) {
+    ast_log(LOG_ERROR, "Unable to get current software parameters: %s\n",
+            snd_strerror(err));
+    goto fail;
+  }
 
   if (stream == SND_PCM_STREAM_PLAYBACK)
     start_threshold = period_size;
@@ -180,29 +198,45 @@ static snd_pcm_t *alsa_card_init(char *dev, snd_pcm_stream_t stream,
     ast_log(LOG_ERROR, "stop threshold: %s\n", snd_strerror(err));
 
   err = snd_pcm_sw_params(handle, swparams);
-  if (err < 0)
+  if (err < 0) {
     ast_log(LOG_ERROR, "sw_params: %s\n", snd_strerror(err));
-
-  err = snd_pcm_poll_descriptors_count(handle);
-  if (err <= 0)
-    ast_log(LOG_ERROR, "Unable to get a poll descriptors count, error is %s\n",
-            snd_strerror(err));
-  if (err != 1) {
-    ast_debug(1, "Can't handle more than one device\n");
+    goto fail;
   }
 
-  snd_pcm_poll_descriptors(handle, &pfd, err);
+  err = snd_pcm_poll_descriptors_count(handle);
+  if (err <= 0) {
+    ast_log(LOG_ERROR, "Unable to get a poll descriptors count, error is %s\n",
+            snd_strerror(err));
+    goto fail;
+  }
+  if (err != 1) {
+    ast_log(LOG_ERROR, "ALSA device %s exposes %d poll descriptors; exactly one is required\n",
+            dev, err);
+    goto fail;
+  }
+
+  err = snd_pcm_poll_descriptors(handle, &pfd, 1);
+  if (err < 0) {
+    ast_log(LOG_ERROR, "Unable to get ALSA poll descriptor for %s: %s\n",
+            dev, snd_strerror(err));
+    goto fail;
+  }
   ast_debug(1, "Acquired fd %d from the poll descriptor\n", pfd.fd);
 
   if (stream == SND_PCM_STREAM_CAPTURE)
     pvt->audio_fd = pfd.fd;
-  else
-    writedev = pfd.fd;
 
   return handle;
+
+fail:
+  snd_pcm_close(handle);
+  return NULL;
 }
 
 static int soundcard_init(struct pvt *pvt) {
+
+  pvt->uses_uac = 1;
+  pvt->audio_rate = CONF_UNIQ(pvt, audio_rate);
 
   pvt->icard =
       alsa_card_init(CONF_UNIQ(pvt, alsadev), SND_PCM_STREAM_CAPTURE, pvt);
@@ -217,13 +251,20 @@ static int soundcard_init(struct pvt *pvt) {
   if (!pvt->ocard) {
     ast_log(LOG_ERROR, "Problem opening ALSA playback device %s \n",
             CONF_UNIQ(pvt, alsadev));
+    snd_pcm_close(pvt->icard);
+    pvt->icard = NULL;
+    pvt->audio_fd = -1;
     return -1;
   }
-  ast_verb(2, "Sound Card %s Initialized\n", CONF_UNIQ(pvt, alsadev));
+  pvt->uac_read_pos = 0;
+  pvt->uac_read_left = pvt_audio_frame_samples(pvt);
+  pvt->uac_write_len = 0;
+  ast_verb(2, "Sound Card %s Initialized at %u Hz\n",
+           CONF_UNIQ(pvt, alsadev), pvt_audio_rate(pvt));
   snd_pcm_prepare(pvt->icard);
   snd_pcm_drop(pvt->icard);
 
-  return writedev;
+  return 0;
 }
 
 static int public_state_init(struct public_state *state);
@@ -417,11 +458,18 @@ static void disconnect_quectel(struct pvt *pvt) {
   }
   at_queue_flush(pvt);
   pvt->last_dialed_cpvt = NULL;
-  if (strcmp(CONF_UNIQ(pvt, quec_uac), "1") == 0) {
-    if (pvt->icard)
+  if (pvt_uses_uac(pvt)) {
+    if (pvt->icard) {
       snd_pcm_close(pvt->icard);
-    if (pvt->ocard)
+      pvt->icard = NULL;
+    }
+    if (pvt->ocard) {
       snd_pcm_close(pvt->ocard);
+      pvt->ocard = NULL;
+    }
+    pvt->uac_read_pos = 0;
+    pvt->uac_read_left = pvt_audio_frame_samples(pvt);
+    pvt->uac_write_len = 0;
   } else
     closetty(pvt->audio_fd, &pvt->alock);
 
@@ -631,7 +679,7 @@ static void *do_monitor_phone(void *data) {
       goto e_cleanup;
     }
 
-    if (strcmp(CONF_UNIQ(pvt, quec_uac), "1") != 0) {
+    if (!pvt_uses_uac(pvt)) {
 
       if (port_status(pvt->audio_fd)) {
         ast_log(LOG_ERROR, "[%s] Lost connection to Quectel\n", dev);
@@ -808,10 +856,15 @@ static void pvt_start(struct pvt *pvt) {
   if (pvt->data_fd < 0) {
     return;
   }
-  if (strcmp(CONF_UNIQ(pvt, quec_uac), "1") == 0) {
+
+  pvt->uses_uac = !strcmp(CONF_UNIQ(pvt, quec_uac), "1");
+  pvt->audio_rate = CONF_UNIQ(pvt, audio_rate);
+  pvt_dsp_setup(pvt, PVT_ID(pvt), CONF_SHARED(pvt, dtmf),
+                pvt_audio_rate(pvt));
+  if (pvt_uses_uac(pvt)) {
     if (pvt->audio_fd < 0)
       if (soundcard_init(pvt) < 0)
-        disconnect_quectel(pvt);
+        goto cleanup_datafd;
   } else {
     // TODO: delay until device activate voice call or at
     // pvt_on_create_1st_channel()
@@ -825,7 +878,7 @@ static void pvt_start(struct pvt *pvt) {
   }
 
   if (!start_monitor(pvt)) {
-    if (strcmp(CONF_UNIQ(pvt, quec_uac), "1") == 0)
+    if (pvt_uses_uac(pvt))
       goto cleanup_datafd;
     else
       goto cleanup_audiofd;
@@ -838,7 +891,7 @@ static void pvt_start(struct pvt *pvt) {
    * read(). */
   flags = fcntl(pvt->data_fd, F_GETFL);
   fcntl(pvt->data_fd, F_SETFL, flags | O_NONBLOCK);
-  if (strcmp(CONF_UNIQ(pvt, quec_uac), "1") != 0) {
+  if (!pvt_uses_uac(pvt)) {
     flags = fcntl(pvt->audio_fd, F_GETFL);
     fcntl(pvt->audio_fd, F_SETFL, flags | O_NONBLOCK);
   }
@@ -976,7 +1029,7 @@ static void discovery_stop(public_state_t *state) {
 
 #/* */
 EXPORT_DEF void pvt_on_create_1st_channel(struct pvt *pvt) {
-  if (strcmp(CONF_UNIQ(pvt, quec_uac), "1") != 0) {
+  if (!pvt_uses_uac(pvt)) {
     mixb_init(&pvt->a_write_mixb, pvt->a_write_buf, sizeof(pvt->a_write_buf));
     //	rb_init (&pvt->a_write_rb, pvt->a_write_buf, sizeof (pvt->a_write_buf));
 
@@ -1503,9 +1556,10 @@ EXPORT_DEF char *rssi2dBm(int rssi, char *buf, unsigned len) {
 
 #/* */
 EXPORT_DEF void pvt_dsp_setup(struct pvt *pvt, const char *id,
-                              dc_dtmf_setting_t dtmf_new) {
+                              dc_dtmf_setting_t dtmf_new,
+                              unsigned int sample_rate) {
   /* first remove dsp if off or changed */
-  if (dtmf_new != CONF_SHARED(pvt, dtmf)) {
+  if (dtmf_new != pvt->real_dtmf || sample_rate != pvt->dsp_rate) {
     if (pvt->dsp) {
       ast_dsp_free(pvt->dsp);
       pvt->dsp = NULL;
@@ -1513,8 +1567,12 @@ EXPORT_DEF void pvt_dsp_setup(struct pvt *pvt, const char *id,
   }
 
   /* wake up and initialize dsp */
-  if (dtmf_new != DC_DTMF_SETTING_OFF) {
+  if (dtmf_new != DC_DTMF_SETTING_OFF && !pvt->dsp) {
+#if ASTERISK_VERSION_NUM >= 130000 /* 13+ */
+    pvt->dsp = ast_dsp_new_with_rate(sample_rate);
+#else
     pvt->dsp = ast_dsp_new();
+#endif
     if (pvt->dsp) {
       int digitmode = DSP_DIGITMODE_DTMF;
       if (dtmf_new == DC_DTMF_SETTING_RELAX)
@@ -1528,6 +1586,7 @@ EXPORT_DEF void pvt_dsp_setup(struct pvt *pvt, const char *id,
     }
   }
   pvt->real_dtmf = dtmf_new;
+  pvt->dsp_rate = sample_rate;
 }
 
 static struct pvt *pvt_create(const pvt_config_t *settings) {
@@ -1541,11 +1600,14 @@ static struct pvt *pvt_create(const pvt_config_t *settings) {
     pvt->sys_chan.state = CALL_STATE_RELEASED;
 
     pvt->monitor_thread = AST_PTHREADT_NULL;
+    /* Audio descriptors and active rate are initialized before settings are copied. */
     pvt->audio_fd = -1;
     pvt->data_fd = -1;
     pvt->timeout = DATA_READ_TIMEOUT;
     pvt->gsm_reg_status = -1;
     pvt->incoming_sms_index = -1U;
+    pvt->uses_uac = !strcmp(UCONFIG(settings, quec_uac), "1");
+    pvt->audio_rate = UCONFIG(settings, audio_rate);
 
     ast_copy_string(pvt->provider_name, "NONE", sizeof(pvt->provider_name));
     ast_copy_string(pvt->subscriber_number, "Unknown",
@@ -1554,7 +1616,8 @@ static struct pvt *pvt_create(const pvt_config_t *settings) {
 
     pvt->desired_state = SCONFIG(settings, initstate);
 
-    pvt_dsp_setup(pvt, UCONFIG(settings, id), SCONFIG(settings, dtmf));
+    pvt_dsp_setup(pvt, UCONFIG(settings, id), SCONFIG(settings, dtmf),
+                  pvt_audio_rate(pvt));
 
     /* and copy settings */
     memcpy(&pvt->settings, settings, sizeof(pvt->settings));
@@ -1607,6 +1670,9 @@ static int pvt_reconfigure(struct pvt *pvt, const pvt_config_t *settings,
              strcmp(UCONFIG(settings, data_tty), CONF_UNIQ(pvt, data_tty)) ||
              strcmp(UCONFIG(settings, imei), CONF_UNIQ(pvt, imei)) ||
              strcmp(UCONFIG(settings, imsi), CONF_UNIQ(pvt, imsi)) ||
+             strcmp(UCONFIG(settings, quec_uac), CONF_UNIQ(pvt, quec_uac)) ||
+             strcmp(UCONFIG(settings, alsadev), CONF_UNIQ(pvt, alsadev)) ||
+             UCONFIG(settings, audio_rate) != CONF_UNIQ(pvt, audio_rate) ||
              SCONFIG(settings, u2diag) != CONF_SHARED(pvt, u2diag) ||
              SCONFIG(settings, resetquectel) !=
                  CONF_SHARED(pvt, resetquectel) ||
@@ -1618,7 +1684,8 @@ static int pvt_reconfigure(struct pvt *pvt, const pvt_config_t *settings,
       pvt->restart_time = rv ? RESTATE_TIME_NOW : when;
     }
 
-    pvt_dsp_setup(pvt, UCONFIG(settings, id), SCONFIG(settings, dtmf));
+    pvt_dsp_setup(pvt, UCONFIG(settings, id), SCONFIG(settings, dtmf),
+                  pvt_audio_rate(pvt));
 
     /* and copy settings */
     memcpy(&pvt->settings, settings, sizeof(pvt->settings));
@@ -1767,8 +1834,10 @@ static int public_state_init(struct public_state *state) {
         return AST_MODULE_LOAD_FAILURE;
       }
       ast_format_cap_append(channel_tech.capabilities, ast_format_slin, 0);
+      ast_format_cap_append(channel_tech.capabilities, ast_format_slin16, 0);
 #elif ASTERISK_VERSION_NUM >= 100000 /* 10-13 */
       ast_format_set(&chan_quectel_format, AST_FORMAT_SLINEAR, 0);
+      ast_format_set(&chan_quectel_format16, AST_FORMAT_SLINEAR16, 0);
 #if ASTERISK_VERSION_NUM >= 120000   /* 12+ */
       if (!(channel_tech.capabilities = ast_format_cap_alloc(0))) {
         return AST_MODULE_LOAD_FAILURE;
@@ -1779,6 +1848,7 @@ static int public_state_init(struct public_state *state) {
       }
 #endif
       ast_format_cap_add(channel_tech.capabilities, &chan_quectel_format);
+      ast_format_cap_add(channel_tech.capabilities, &chan_quectel_format16);
       chan_quectel_format_cap = channel_tech.capabilities;
 #endif /* ^10-13 */
 

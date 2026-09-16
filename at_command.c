@@ -541,7 +541,7 @@ EXPORT_DEF int at_enqueue_dial(struct cpvt *cpvt, const char *number, int clir)
 	}
         if (pvt->is_simcom) {
 	err = at_fill_generic_cmd(&cmds[cmdsno], "AT+CPCMREG=0;D%s;\r", number); }
-        else if (strcmp(CONF_UNIQ(pvt, quec_uac),"1") == 0) {
+        else if (pvt_uses_uac(pvt)) {
         err = at_fill_generic_cmd(&cmds[cmdsno], "AT+QPCMV=0;+QPCMV=1,2;D%s;\r", number); }
         else {
         err = at_fill_generic_cmd(&cmds[cmdsno], "AT+QPCMV=0;+QPCMV=1,0;D%s;\r", number); }
@@ -592,7 +592,7 @@ EXPORT_DEF int at_enqueue_answer(struct cpvt *cpvt)
 /* FIXME: channel number? */
              if (pvt->is_simcom) {
 		cmd1 = "AT+CPCMREG=0;A\r"; }
-             else if (strcmp(CONF_UNIQ(pvt, quec_uac),"1") == 0) { 
+             else if (pvt_uses_uac(pvt)) {
                 cmd1 = "AT+QPCMV=0;+QPCMV=1,2;A\r"; }
              else { 
                 cmd1 = "AT+QPCMV=0;+QPCMV=1,0;A\r"; }
@@ -1011,4 +1011,3 @@ EXPORT_DEF void at_hangup_immediality(struct cpvt* cpvt)
 	if(length > 0)
 		at_write(cpvt->pvt, buf, length);
 }
-

@@ -27,8 +27,15 @@
 #include "at_command.h"
 
 #include <alsa/asoundlib.h>
-#define PERIOD_FRAMES           80
-#define DESIRED_RATE 8000
+#define AUDIO_RATE_NARROWBAND       8000
+#define AUDIO_RATE_WIDEBAND        16000
+#define AUDIO_FRAME_MS                20
+#define AUDIO_BYTES_PER_SAMPLE         2
+#define AUDIO_MAX_FRAME_SAMPLES \
+  (AUDIO_RATE_WIDEBAND * AUDIO_FRAME_MS / 1000)
+#define AUDIO_MAX_FRAME_BYTES \
+  (AUDIO_MAX_FRAME_SAMPLES * AUDIO_BYTES_PER_SAMPLE)
+#define UAC_WRITE_BUFFER_BYTES (AUDIO_MAX_FRAME_BYTES * 16)
 #define ALSA_PCM_NEW_HW_PARAMS_API
 #define ALSA_PCM_NEW_SW_PARAMS_API
 #include <fcntl.h>
@@ -42,8 +49,6 @@ static snd_pcm_format_t format = SND_PCM_FORMAT_S16_BE;
 static int silencesuppression = 0;
 static int silencethreshold = 1000;
 #define MAX_BUFFER_SIZE 100
-
-static int writedev = -1;
 
 #define MODULE_DESCRIPTION	"Channel Driver for Mobile Telephony"
 #define MAXQUECTELDEVICES	128
@@ -60,8 +65,9 @@ INLINE_DECL const char * dev_state2str_msg(dev_state_t state)
 }
 
 #if ASTERISK_VERSION_NUM >= 100000 && ASTERISK_VERSION_NUM < 130000 /* 10-13 */
-/* Only linear is allowed */
+/* Signed linear formats used by narrowband and wideband devices. */
 EXPORT_DECL struct ast_format chan_quectel_format;
+EXPORT_DECL struct ast_format chan_quectel_format16;
 EXPORT_DECL struct ast_format_cap * chan_quectel_format_cap;
 #endif /* ^10-13 */
 
@@ -141,12 +147,20 @@ typedef struct pvt
 	pthread_t		monitor_thread;			/*!< monitor (at commands reader) thread handle */
 
         snd_pcm_t               *icard, *ocard;
+	unsigned int		uses_uac;			/*!< active audio transport */
+	unsigned int		audio_rate;			/*!< active PCM sample rate */
+	unsigned int		uac_read_pos;
+	unsigned int		uac_read_left;
+	short			uac_read_buf[AUDIO_MAX_FRAME_SAMPLES + AST_FRIENDLY_OFFSET / 2];
+	char			uac_write_buf[UAC_WRITE_BUFFER_BYTES];
+	size_t			uac_write_len;
 	int			audio_fd;			/*!< audio descriptor */
 	int			data_fd;			/*!< data descriptor */
 	char			* alock;			/*!< name of lockfile for audio */
 	char			* dlock;			/*!< name of lockfile for data */
 
 	struct ast_dsp*		dsp;				/*!< silence/DTMF detector - FIXME: must be in cpvt */
+	unsigned int		dsp_rate;			/*!< sample rate configured in dsp */
 	dc_dtmf_setting_t	real_dtmf;			/*!< real DTMF setting */
 
 	struct ast_timer*	a_timer;			/*!< audio write timer */
@@ -237,6 +251,21 @@ typedef struct pvt
 #define CONF_UNIQ(pvt, name)		UCONFIG(&((pvt)->settings), name)
 #define PVT_ID(pvt)			UCONFIG(&((pvt)->settings), id)
 
+INLINE_DECL int pvt_uses_uac(const struct pvt *pvt)
+{
+	return pvt->uses_uac;
+}
+
+INLINE_DECL unsigned int pvt_audio_rate(const struct pvt *pvt)
+{
+	return pvt->audio_rate;
+}
+
+INLINE_DECL unsigned int pvt_audio_frame_samples(const struct pvt *pvt)
+{
+	return pvt_audio_rate(pvt) * AUDIO_FRAME_MS / 1000;
+}
+
 #define PVT_STATE(pvt, name)		PVT_STATE_T(&(pvt)->state, name)
 #define PVT_STAT(pvt, name)		PVT_STAT_T(&(pvt)->stat, name)
 
@@ -285,7 +314,7 @@ INLINE_DECL struct pvt * find_device (const char* name)
 
 EXPORT_DECL struct pvt * find_device_ext(const char* name);
 EXPORT_DECL struct pvt * find_device_by_resource_ex(struct public_state * state, const char * resource, int opts, const struct ast_channel * requestor, int * exists);
-EXPORT_DECL void pvt_dsp_setup(struct pvt * pvt, const char * id, dc_dtmf_setting_t dtmf_new);
+EXPORT_DECL void pvt_dsp_setup(struct pvt * pvt, const char * id, dc_dtmf_setting_t dtmf_new, unsigned int sample_rate);
 
 INLINE_DECL struct pvt * find_device_by_resource(const char * resource, int opts, const struct ast_channel * requestor, int * exists)
 {
