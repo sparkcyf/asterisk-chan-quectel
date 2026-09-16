@@ -68,41 +68,86 @@ static int pvt_ast_format(const struct pvt *pvt)
 }
 #endif /* ^10- */
 
-/*
- * Start the USB playback stream while the call is dialing so that the modem's
- * UAC endpoint is already consuming samples when the call is answered.  Some
- * EG25-G firmware takes several hundred milliseconds to start consuming from
- * a newly started playback stream.  Starting with live audio in that state
- * fills both the ALSA and driver buffers and clips the beginning of the call.
- *
- * Keep at most roughly one 20 ms period of silence queued.  This is enough to
- * keep the endpoint warm without adding a noticeable playback delay at answer.
- * The caller holds pvt->lock.
- */
-static void uac_prime_playback(struct pvt *pvt)
+/* Remove bytes from the front of the UAC playback queue. */
+static void uac_playback_consume(struct pvt *pvt, size_t count)
 {
-	short silence[AUDIO_MAX_FRAME_SAMPLES] = { 0 };
-	snd_pcm_sframes_t delay = 0;
+	if (count > pvt->uac_write_len)
+		count = pvt->uac_write_len;
+	pvt->uac_write_len -= count;
+	if (pvt->uac_write_len)
+		memmove(pvt->uac_write_buf, pvt->uac_write_buf + count,
+				pvt->uac_write_len);
+}
+
+/*
+ * Clock UAC playback from the capture endpoint.  USB audio playback must be
+ * fed continuously: if the SIP peer is silent or uses DTX, the ALSA stream
+ * otherwise underruns and some EG25-G firmware takes hundreds of milliseconds
+ * to resume consuming audio.  That startup gap used to fill the driver queue
+ * and clip the next speech or DTMF burst.
+ *
+ * A complete capture frame arrives every 20 ms.  Write exactly one playback
+ * frame at the same cadence, using queued voice followed by silence.  The
+ * caller holds pvt->lock, so this is serialized with channel_write().
+ */
+static void uac_playback_tick(struct pvt *pvt)
+{
+	short frame[AUDIO_MAX_FRAME_SAMPLES] = { 0 };
+	const size_t frame_bytes = pvt_audio_frame_samples(pvt) *
+			AUDIO_BYTES_PER_SAMPLE;
+	const size_t queued_bytes = pvt->uac_write_len < frame_bytes
+			? pvt->uac_write_len : frame_bytes;
 	snd_pcm_sframes_t written;
-	snd_pcm_uframes_t frame_samples = pvt_audio_frame_samples(pvt);
-	snd_pcm_state_t state = snd_pcm_state(pvt->ocard);
+	size_t written_bytes;
+	size_t consumed_bytes;
+	snd_pcm_state_t state;
+	int recover_res;
 
+	if (queued_bytes)
+		memcpy(frame, pvt->uac_write_buf, queued_bytes);
+
+	state = snd_pcm_state(pvt->ocard);
 	if (state != SND_PCM_STATE_PREPARED && state != SND_PCM_STATE_RUNNING) {
-		if (snd_pcm_recover(pvt->ocard, -EPIPE, 1) < 0)
+		if (state == SND_PCM_STATE_SUSPENDED)
+			recover_res = snd_pcm_recover(pvt->ocard, -ESTRPIPE, 1);
+		else
+			recover_res = snd_pcm_prepare(pvt->ocard);
+		if (recover_res < 0) {
+			ast_log(LOG_ERROR, "[%s] Unable to prepare UAC playback: %s\n",
+					PVT_ID(pvt), snd_strerror(recover_res));
 			return;
-		state = snd_pcm_state(pvt->ocard);
+		}
 	}
 
-	if (state == SND_PCM_STATE_RUNNING &&
-			snd_pcm_delay(pvt->ocard, &delay) == 0 &&
-			delay >= (snd_pcm_sframes_t) frame_samples)
-		return;
-
-	written = snd_pcm_writei(pvt->ocard, silence, frame_samples);
+	written = snd_pcm_writei(pvt->ocard, frame,
+			pvt_audio_frame_samples(pvt));
 	if (written < 0 && written != -EAGAIN) {
-		if (snd_pcm_recover(pvt->ocard, written, 1) >= 0)
-			snd_pcm_writei(pvt->ocard, silence, frame_samples);
+		recover_res = snd_pcm_recover(pvt->ocard, written, 1);
+		if (recover_res < 0) {
+			ast_log(LOG_ERROR, "[%s] UAC playback recovery failed: %s\n",
+					PVT_ID(pvt), snd_strerror(recover_res));
+			return;
+		}
+		written = snd_pcm_writei(pvt->ocard, frame,
+				pvt_audio_frame_samples(pvt));
 	}
+	if (written == -EAGAIN || written == 0)
+		return;
+	if (written < 0) {
+		ast_log(LOG_ERROR, "[%s] UAC playback write failed: %s\n",
+				PVT_ID(pvt), snd_strerror(written));
+		return;
+	}
+
+	written_bytes = (size_t) written * AUDIO_BYTES_PER_SAMPLE;
+	consumed_bytes = queued_bytes < written_bytes
+			? queued_bytes : written_bytes;
+	uac_playback_consume(pvt, consumed_bytes);
+	PVT_STAT(pvt, a_write_bytes) += written_bytes;
+	if (!queued_bytes)
+		PVT_STAT(pvt, write_sframes)++;
+	else if (queued_bytes < frame_bytes || written_bytes < frame_bytes)
+		PVT_STAT(pvt, write_tframes)++;
 }
 
 #/* */
@@ -380,7 +425,13 @@ static void disactivate_call(struct cpvt* cpvt)
 
 	if(cpvt->channel && CPVT_TEST_FLAG(cpvt, CALL_FLAG_ACTIVATED))
 	{
-				if (pvt_uses_uac(pvt)) snd_pcm_drop(pvt->icard);
+				if (pvt_uses_uac(pvt)) {
+					snd_pcm_drop(pvt->icard);
+					snd_pcm_drop(pvt->ocard);
+					pvt->uac_read_pos = 0;
+					pvt->uac_read_left = pvt_audio_frame_samples(pvt);
+					pvt->uac_write_len = 0;
+				}
 		else mixb_detach(&cpvt->pvt->a_write_mixb, &cpvt->mixstream);
 		ast_channel_set_fd (cpvt->channel, 1, -1);
 		ast_channel_set_fd (cpvt->channel, 0, -1);
@@ -430,15 +481,14 @@ static void activate_call(struct cpvt* cpvt)
 		// FIXME: reset possition?
 		if (!pvt_uses_uac(pvt)) mixb_attach(&pvt->a_write_mixb, &cpvt->mixstream);
                 else {
-	        snd_pcm_state_t state;
 		pvt->uac_read_pos = 0;
 		pvt->uac_read_left = pvt_audio_frame_samples(pvt);
 		pvt->uac_write_len = 0;
-	        state = snd_pcm_state(pvt->icard);
-	        if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING)) {
-                snd_pcm_prepare(pvt->icard);
-                snd_pcm_start(pvt->icard);
-                                                                                            }
+		snd_pcm_drop(pvt->icard);
+		snd_pcm_drop(pvt->ocard);
+		if (snd_pcm_prepare(pvt->icard) >= 0)
+			snd_pcm_start(pvt->icard);
+		snd_pcm_prepare(pvt->ocard);
                       }                
 //		rb_init (&cpvt->a_write_rb, cpvt->a_write_buf, sizeof (cpvt->a_write_buf));
 //		cpvt->write = pvt->a_write_rb.write;
@@ -896,9 +946,6 @@ e_return:
 	snd_pcm_state_t state;
 	int r;
 
-	if (!CPVT_IS_ACTIVE(cpvt))
-		uac_prime_playback(pvt);
-
 	memset(f, 0, sizeof(*f));
 	f->frametype = AST_FRAME_NULL;
 	f->src = AST_MODULE;
@@ -934,6 +981,7 @@ e_return:
 
 	pvt->uac_read_pos = 0;
 	pvt->uac_read_left = frame_samples;
+	uac_playback_tick(pvt);
 	f->frametype = AST_FRAME_VOICE;
 #if ASTERISK_VERSION_NUM >= 130000 /* 13+ */
 	f->subclass.format = pvt_ast_format(pvt);
@@ -1173,8 +1221,9 @@ e_return:
 	return 0;
         }
         else {
-	int res = 0;
-	size_t written_bytes;
+	size_t drop_bytes = 0;
+	size_t source_offset = 0;
+	size_t queued_bytes;
 
 	while (ast_mutex_trylock (&pvt->lock))
 	{
@@ -1189,56 +1238,36 @@ e_return:
 		ast_debug(1, "[%s] Volume could not be adjusted!\n", PVT_ID(pvt));
 
 	if ((size_t) f->datalen > sizeof(pvt->uac_write_buf)) {
-		ast_log(LOG_ERROR, "[%s] UAC frame is too large: %d bytes\n",
-				PVT_ID(pvt), f->datalen);
-		res = -1;
-		goto uac_write_return;
-	}
-	if ((size_t) f->datalen > sizeof(pvt->uac_write_buf) - pvt->uac_write_len) {
-		ast_log(LOG_WARNING, "[%s] UAC playback backlog overflow; dropping %zu stale bytes\n",
-				PVT_ID(pvt), pvt->uac_write_len);
+		source_offset = (size_t) f->datalen - sizeof(pvt->uac_write_buf);
+		drop_bytes += source_offset;
 		pvt->uac_write_len = 0;
-		PVT_STAT(pvt, write_rb_overflow)++;
+	}
+
+	queued_bytes = (size_t) f->datalen - source_offset;
+	if (queued_bytes > sizeof(pvt->uac_write_buf) - pvt->uac_write_len) {
+		size_t stale_bytes = queued_bytes -
+				(sizeof(pvt->uac_write_buf) - pvt->uac_write_len);
+		drop_bytes += stale_bytes;
+		uac_playback_consume(pvt, stale_bytes);
 	}
 
 	memcpy(pvt->uac_write_buf + pvt->uac_write_len,
-			f->data.ptr, f->datalen);
-	pvt->uac_write_len += f->datalen;
+			(char *) f->data.ptr + source_offset, queued_bytes);
+	pvt->uac_write_len += queued_bytes;
 	PVT_STAT(pvt, write_frames)++;
 
-	while (pvt->uac_write_len >= AUDIO_BYTES_PER_SAMPLE) {
-		res = snd_pcm_writei(pvt->ocard, pvt->uac_write_buf,
-				pvt->uac_write_len / AUDIO_BYTES_PER_SAMPLE);
-		if (res == -EAGAIN) {
-			res = 0;
-			break;
-		}
-		if (res < 0) {
-			int recover_res = snd_pcm_recover(pvt->ocard, res, 1);
-			if (recover_res < 0) {
-				ast_log(LOG_ERROR, "[%s] UAC write error: %s\n",
-						PVT_ID(pvt), snd_strerror(res));
-				res = recover_res;
-				break;
-			}
-			continue;
-		}
-		if (res == 0)
-			break;
-
-		written_bytes = (size_t) res * AUDIO_BYTES_PER_SAMPLE;
-		pvt->uac_write_len -= written_bytes;
-		PVT_STAT(pvt, a_write_bytes) += written_bytes;
-		if (pvt->uac_write_len)
-			memmove(pvt->uac_write_buf,
-					pvt->uac_write_buf + written_bytes,
-					pvt->uac_write_len);
+	if (drop_bytes) {
+		PVT_STAT(pvt, write_rb_overflow_bytes) += drop_bytes;
+		PVT_STAT(pvt, write_rb_overflow)++;
+		ast_log(LOG_WARNING,
+				"[%s] UAC playback backlog overflow; dropping %zu oldest bytes\n",
+				PVT_ID(pvt), drop_bytes);
 	}
 
 uac_write_return:
 	ast_mutex_unlock (&pvt->lock);
 
-	return res >= 0 ? 0 : res;
+	return 0;
            }
 }
 #undef subclass_integer
