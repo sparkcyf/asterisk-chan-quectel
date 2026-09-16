@@ -433,7 +433,10 @@ EXPORT_DEF int at_enqueue_dtmf(struct cpvt *cpvt, char digit)
 
 		case '*':
 		case '#':
-			return at_enqueue_generic(cpvt, CMD_AT_DTMF, 1, "AT+VTS=%c\r", digit);
+			/* Quectel requires the DTMF string to be quoted.  In particular,
+			 * an unquoted '#' can leave the command pending until it times out. */
+			return at_enqueue_generic(cpvt, CMD_AT_DTMF, 1,
+					"AT+VTS=\"%c\"\r", digit);
 	}
 	return -1;
 }
