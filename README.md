@@ -40,6 +40,30 @@ If you did not `make install` Asterisk in the usual location and configure
 cannot find the asterisk header files in `/usr/include/asterisk`, you may
 optionally pass `--with-asterisk=PATH/TO/INCLUDE`.
 
+Audio modes:
+------------
+
+Serial audio and UAC audio both default to 8 kHz for backward compatibility.
+Set `audio_rate=16000` in a device section only when `quec_uac=1` and the
+modem's UAC interface has already been configured to expose 16 kHz PCM.  The
+driver rejects 16 kHz with serial audio and rejects unsupported rate values.
+
+    ; Serial PCM, always 8 kHz
+    audio=/dev/ttyUSB1
+    data=/dev/ttyUSB2
+
+    ; UAC at 8 kHz
+    data=/dev/ttyUSB2
+    quec_uac=1
+    alsadev=hw:CARD=EG25G,DEV=0
+    audio_rate=8000
+
+    ; UAC at 16 kHz (only after the modem/firmware exposes 16 kHz)
+    data=/dev/ttyUSB2
+    quec_uac=1
+    alsadev=hw:CARD=EG25G,DEV=0
+    audio_rate=16000
+
 Here is an example for the dialplan:
 ------------------------------------
 
@@ -134,5 +158,4 @@ Other CLI commands:
     quectel reload gracefully
     quectel reload now
     quectel reload when convenient
-
 

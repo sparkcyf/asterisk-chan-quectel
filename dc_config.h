@@ -117,6 +117,7 @@ typedef struct dc_uconfig
 	char			imsi[IMSI_SIZE+1];		/*!< search device by imsi */
         char                    quec_uac[2];
         char			alsadev[DEVNAMELEN];
+	unsigned int		audio_rate;			/*!< PCM sample rate: 8000 for serial/UAC, 16000 for UAC only */
 } dc_uconfig_t;
 
 /* all Config settings join in one place */

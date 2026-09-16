@@ -42,6 +42,69 @@
 
 static char silence_frame[FRAME_SIZE];
 
+#if ASTERISK_VERSION_NUM >= 130000 /* 13+ */
+static struct ast_format *pvt_ast_format(const struct pvt *pvt)
+{
+	return pvt_audio_rate(pvt) == AUDIO_RATE_WIDEBAND
+		? ast_format_slin16 : ast_format_slin;
+}
+#elif ASTERISK_VERSION_NUM >= 100000 /* 10-13 */
+static struct ast_format *pvt_ast_format(const struct pvt *pvt)
+{
+	return pvt_audio_rate(pvt) == AUDIO_RATE_WIDEBAND
+		? &chan_quectel_format16 : &chan_quectel_format;
+}
+#elif ASTERISK_VERSION_NUM >= 10800 /* 1.8+ .. 10- */
+static format_t pvt_ast_format(const struct pvt *pvt)
+{
+	return pvt_audio_rate(pvt) == AUDIO_RATE_WIDEBAND
+		? AST_FORMAT_SLINEAR16 : AST_FORMAT_SLINEAR;
+}
+#else /* 1.8- */
+static int pvt_ast_format(const struct pvt *pvt)
+{
+	return pvt_audio_rate(pvt) == AUDIO_RATE_WIDEBAND
+		? AST_FORMAT_SLINEAR16 : AST_FORMAT_SLINEAR;
+}
+#endif /* ^10- */
+
+/*
+ * Start the USB playback stream while the call is dialing so that the modem's
+ * UAC endpoint is already consuming samples when the call is answered.  Some
+ * EG25-G firmware takes several hundred milliseconds to start consuming from
+ * a newly started playback stream.  Starting with live audio in that state
+ * fills both the ALSA and driver buffers and clips the beginning of the call.
+ *
+ * Keep at most roughly one 20 ms period of silence queued.  This is enough to
+ * keep the endpoint warm without adding a noticeable playback delay at answer.
+ * The caller holds pvt->lock.
+ */
+static void uac_prime_playback(struct pvt *pvt)
+{
+	short silence[AUDIO_MAX_FRAME_SAMPLES] = { 0 };
+	snd_pcm_sframes_t delay = 0;
+	snd_pcm_sframes_t written;
+	snd_pcm_uframes_t frame_samples = pvt_audio_frame_samples(pvt);
+	snd_pcm_state_t state = snd_pcm_state(pvt->ocard);
+
+	if (state != SND_PCM_STATE_PREPARED && state != SND_PCM_STATE_RUNNING) {
+		if (snd_pcm_recover(pvt->ocard, -EPIPE, 1) < 0)
+			return;
+		state = snd_pcm_state(pvt->ocard);
+	}
+
+	if (state == SND_PCM_STATE_RUNNING &&
+			snd_pcm_delay(pvt->ocard, &delay) == 0 &&
+			delay >= (snd_pcm_sframes_t) frame_samples)
+		return;
+
+	written = snd_pcm_writei(pvt->ocard, silence, frame_samples);
+	if (written < 0 && written != -EAGAIN) {
+		if (snd_pcm_recover(pvt->ocard, written, 1) >= 0)
+			snd_pcm_writei(pvt->ocard, silence, frame_samples);
+	}
+}
+
 #/* */
 static int parse_dial_string(char * dialstr, const char** number, int * opts)
 {
@@ -155,7 +218,8 @@ static struct ast_channel * channel_request(
 	}
 
 #if ASTERISK_VERSION_NUM >= 130000 /* 13+ */
-	if (ast_format_cap_iscompatible_format(cap, ast_format_slin) != AST_FORMAT_CMP_EQUAL)
+	if (ast_format_cap_iscompatible_format(cap, ast_format_slin) != AST_FORMAT_CMP_EQUAL &&
+			ast_format_cap_iscompatible_format(cap, ast_format_slin16) != AST_FORMAT_CMP_EQUAL)
 	{
 		struct ast_str *codec_buf = ast_str_alloca(64);
 		ast_log(LOG_WARNING, "Asked to get a channel of unsupported format '%s'\n",
@@ -164,7 +228,8 @@ static struct ast_channel * channel_request(
 		return NULL;
 	}
 #elif ASTERISK_VERSION_NUM >= 100000 /* 10-13 */
-	if (!ast_format_cap_iscompatible(cap, &chan_quectel_format))
+	if (!ast_format_cap_iscompatible(cap, &chan_quectel_format) &&
+			!ast_format_cap_iscompatible(cap, &chan_quectel_format16))
 	{
 		char buf[255];
 		ast_log(LOG_WARNING, "Asked to get a channel of unsupported format '%s'\n",
@@ -174,7 +239,7 @@ static struct ast_channel * channel_request(
 	}
 #else /* 10- */
 	oldformat = format;
-	format &= AST_FORMAT_SLINEAR;
+	format &= AST_FORMAT_SLINEAR | AST_FORMAT_SLINEAR16;
 	if (!format)
 	{
 #if ASTERISK_VERSION_NUM >= 10800 /* 1.8+ */
@@ -315,7 +380,7 @@ static void disactivate_call(struct cpvt* cpvt)
 
 	if(cpvt->channel && CPVT_TEST_FLAG(cpvt, CALL_FLAG_ACTIVATED))
 	{
-                if (strcmp(CONF_UNIQ(pvt, quec_uac),"1") == 0) snd_pcm_drop(pvt->icard);
+				if (pvt_uses_uac(pvt)) snd_pcm_drop(pvt->icard);
 		else mixb_detach(&cpvt->pvt->a_write_mixb, &cpvt->mixstream);
 		ast_channel_set_fd (cpvt->channel, 1, -1);
 		ast_channel_set_fd (cpvt->channel, 0, -1);
@@ -350,7 +415,7 @@ static void activate_call(struct cpvt* cpvt)
 			if(cpvt2->channel)
 			{
 				ast_channel_set_fd (cpvt2->channel, 1, -1);
-				if(CPVT_TEST_FLAG(cpvt, CALL_FLAG_ACTIVATED) && strcmp(CONF_UNIQ(pvt, quec_uac),"1") != 0)
+				if(CPVT_TEST_FLAG(cpvt, CALL_FLAG_ACTIVATED) && !pvt_uses_uac(pvt))
 				{
 					ast_channel_set_fd (cpvt2->channel, 0, cpvt2->rd_pipe[PIPE_READ]);
 					ast_debug (6, "[%s] call idx %d still active fd %d\n", PVT_ID(pvt), cpvt2->call_idx, cpvt2->rd_pipe[PIPE_READ]);
@@ -363,9 +428,12 @@ static void activate_call(struct cpvt* cpvt)
 	if(!CPVT_TEST_FLAG(cpvt, CALL_FLAG_ACTIVATED))
 	{
 		// FIXME: reset possition?
-		if (strcmp(CONF_UNIQ(pvt, quec_uac),"1") != 0) mixb_attach(&pvt->a_write_mixb, &cpvt->mixstream);
+		if (!pvt_uses_uac(pvt)) mixb_attach(&pvt->a_write_mixb, &cpvt->mixstream);
                 else {
 	        snd_pcm_state_t state;
+		pvt->uac_read_pos = 0;
+		pvt->uac_read_left = pvt_audio_frame_samples(pvt);
+		pvt->uac_write_len = 0;
 	        state = snd_pcm_state(pvt->icard);
 	        if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING)) {
                 snd_pcm_prepare(pvt->icard);
@@ -383,7 +451,7 @@ static void activate_call(struct cpvt* cpvt)
 		if(cpvt->channel)
 		{
 			ast_channel_set_fd (cpvt->channel, 0, pvt->audio_fd);
-			if (pvt->a_timer && strcmp(CONF_UNIQ(pvt, quec_uac),"1") != 0)
+			if (pvt->a_timer && !pvt_uses_uac(pvt))
 			{
 				ast_channel_set_fd (cpvt->channel, 1, ast_timer_fd (pvt->a_timer));
 				ast_timer_set_rate (pvt->a_timer, 50);
@@ -696,7 +764,7 @@ static struct ast_frame* channel_read (struct ast_channel* channel)
 		goto e_return;
 	}
 
-        if (strcmp(CONF_UNIQ(pvt, quec_uac),"1") != 0) {
+        if (!pvt_uses_uac(pvt)) {
 
 	if (pvt->a_timer && ast_channel_fdno(channel) == 1)
 	{
@@ -822,132 +890,105 @@ e_return:
 	return f;
         }
         else {
-	static struct ast_frame f;
-	static short __buf[FRAME_SIZE2 + AST_FRIENDLY_OFFSET / 2];
-	short *buf;
-	static int readpos = 0;
-	static int left = FRAME_SIZE2;
+	struct ast_frame *f = &cpvt->a_read_frame;
+	short *buf = pvt->uac_read_buf + AST_FRIENDLY_OFFSET / 2;
+	unsigned int frame_samples = pvt_audio_frame_samples(pvt);
 	snd_pcm_state_t state;
-	int r = 0;
+	int r;
 
-	f.frametype = AST_FRAME_NULL;
-	f.subclass.integer = 0;
-	f.samples = 0;
-	f.datalen = 0;
-	f.data.ptr = NULL;
-	f.offset = 0;
-	f.src = AST_MODULE;
-	f.mallocd = 0;
-	f.delivery.tv_sec = 0;
-	f.delivery.tv_usec = 0;
+	if (!CPVT_IS_ACTIVE(cpvt))
+		uac_prime_playback(pvt);
+
+	memset(f, 0, sizeof(*f));
+	f->frametype = AST_FRAME_NULL;
+	f->src = AST_MODULE;
+
 	state = snd_pcm_state(pvt->icard);
 	if ((state != SND_PCM_STATE_PREPARED) && (state != SND_PCM_STATE_RUNNING)) {
-		snd_pcm_prepare(pvt->icard);
-
+		if (snd_pcm_prepare(pvt->icard) < 0)
+			goto uac_return;
 	}
 
-	buf = __buf + AST_FRIENDLY_OFFSET / 2;
-
-	r = snd_pcm_readi(pvt->icard, buf + readpos, left);
-	if (r == -EPIPE) {
-#if DEBUG
-		ast_log(LOG_ERROR, "XRUN read\n");
-#endif
-		snd_pcm_prepare(pvt->icard);
-	} else if (r == -ESTRPIPE) {
-		ast_log(LOG_ERROR, "-ESTRPIPE\n");
-		snd_pcm_prepare(pvt->icard);
-	} else if (r < 0) {
-		ast_log(LOG_ERROR, "Read error: %s\n", snd_strerror(r));
+	if (!pvt->uac_read_left || pvt->uac_read_left > frame_samples) {
+		pvt->uac_read_pos = 0;
+		pvt->uac_read_left = frame_samples;
 	}
 
-	/* Return NULL frame on error */
+	r = snd_pcm_readi(pvt->icard, buf + pvt->uac_read_pos,
+			pvt->uac_read_left);
+	if (r == -EAGAIN || r == 0)
+		goto uac_return;
 	if (r < 0) {
-		ast_mutex_unlock (&pvt->lock);
-		return &f;
+		if (snd_pcm_recover(pvt->icard, r, 1) < 0)
+			ast_log(LOG_ERROR, "[%s] UAC read error: %s\n",
+					PVT_ID(pvt), snd_strerror(r));
+		pvt->uac_read_pos = 0;
+		pvt->uac_read_left = frame_samples;
+		goto uac_return;
 	}
-	readpos += r;
-	left -= r;
 
-	if (readpos >= FRAME_SIZE2) {
-		/* A real frame */
-		readpos = 0;
-		left = FRAME_SIZE2;
-#if 0
-                if (ast_channel_state(channel) != AST_STATE_UP){
-			/* Don't transmit unless it's up */
-			ast_mutex_unlock(&pvt->lock);
-			return &f;
-		}
-#endif
-		f.frametype = AST_FRAME_VOICE;
-		f.subclass.format = ast_format_slin;
-		f.samples = FRAME_SIZE2;
-		f.datalen = FRAME_SIZE2 * 2;
-		f.data.ptr = buf;
-		f.offset = AST_FRIENDLY_OFFSET;
-		f.src = AST_MODULE;
-		f.mallocd = 0;
-		if (pvt->dsp)
-		{
-                        struct ast_frame*	p;
-			p = ast_dsp_process (channel, pvt->dsp, &f);
-			if ((p->frametype == AST_FRAME_DTMF_END) || (p->frametype == AST_FRAME_DTMF_BEGIN))
-			{
-				if ((p->subclass_integer == 'm') || (p->subclass_integer == 'u'))
-				{
-					p->frametype = AST_FRAME_NULL;
-					p->subclass_integer = 0;
-						ast_mutex_unlock (&pvt->lock);
+	pvt->uac_read_pos += r;
+	pvt->uac_read_left -= r;
+	if (pvt->uac_read_pos < frame_samples)
+		goto uac_return;
 
-	                                        return p;
-				}
-				if(p->frametype == AST_FRAME_DTMF_BEGIN)
-				{
-					pvt->dtmf_begin_time = ast_tvnow();
-				}
-				else if (p->frametype == AST_FRAME_DTMF_END)
-				{
-					if(!ast_tvzero(pvt->dtmf_begin_time) && ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_begin_time) < CONF_SHARED(pvt, mindtmfgap))
-					{
-						ast_debug(1, "[%s] DTMF char %c ignored min gap %d > %ld\n", PVT_ID(pvt), p->subclass_integer, CONF_SHARED(pvt, mindtmfgap), (long)ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_begin_time));
-						p->frametype = AST_FRAME_NULL;
-						p->subclass_integer = 0;
-					}
-					else if(p->len < CONF_SHARED(pvt, mindtmfduration))
-					{
-						ast_debug(1, "[%s] DTMF char %c ignored min duration %d > %ld\n", PVT_ID(pvt), p->subclass_integer, CONF_SHARED(pvt, mindtmfduration), p->len);
-						p->frametype = AST_FRAME_NULL;
-						p->subclass_integer = 0;
-					}
-					else if(p->subclass_integer == pvt->dtmf_digit
-							&&
-						!ast_tvzero(pvt->dtmf_end_time)
-							&&
-						ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_end_time) < CONF_SHARED(pvt, mindtmfinterval))
-					{
-						ast_debug(1, "[%s] DTMF char %c ignored min interval %d > %ld\n", PVT_ID(pvt), p->subclass_integer, CONF_SHARED(pvt, mindtmfinterval), (long)ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_end_time));
-						p->frametype = AST_FRAME_NULL;
-						p->subclass_integer = 0;
-					}
-					else
-					{
-						ast_debug(1, "[%s] Got DTMF char %c\n",PVT_ID(pvt), p->subclass_integer);
-						pvt->dtmf_digit = p->subclass_integer;
-						pvt->dtmf_end_time = ast_tvnow();
-					}
+	pvt->uac_read_pos = 0;
+	pvt->uac_read_left = frame_samples;
+	f->frametype = AST_FRAME_VOICE;
+#if ASTERISK_VERSION_NUM >= 130000 /* 13+ */
+	f->subclass.format = pvt_ast_format(pvt);
+#elif ASTERISK_VERSION_NUM >= 100000 /* 10-13 */
+	ast_format_copy(&f->subclass.format, pvt_ast_format(pvt));
+#else /* 10- */
+	f->subclass_codec = pvt_ast_format(pvt);
+#endif /* ^10- */
+	f->samples = frame_samples;
+	f->datalen = frame_samples * AUDIO_BYTES_PER_SAMPLE;
+	f->data.ptr = buf;
+	f->offset = AST_FRIENDLY_OFFSET;
+	f->src = AST_MODULE;
 
-				}
-					ast_mutex_unlock (&pvt->lock);
+	PVT_STAT(pvt, a_read_bytes) += f->datalen;
+	PVT_STAT(pvt, read_frames)++;
 
-	                                return p;
+	if (pvt->dsp) {
+		f = ast_dsp_process(channel, pvt->dsp, f);
+		if (f->frametype == AST_FRAME_DTMF_END ||
+				f->frametype == AST_FRAME_DTMF_BEGIN) {
+			if (f->subclass_integer == 'm' || f->subclass_integer == 'u') {
+				f->frametype = AST_FRAME_NULL;
+				f->subclass_integer = 0;
+			} else if (f->frametype == AST_FRAME_DTMF_BEGIN) {
+				pvt->dtmf_begin_time = ast_tvnow();
+			} else if (!ast_tvzero(pvt->dtmf_begin_time) &&
+					ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_begin_time) <
+					CONF_SHARED(pvt, mindtmfgap)) {
+				f->frametype = AST_FRAME_NULL;
+				f->subclass_integer = 0;
+			} else if (f->len < CONF_SHARED(pvt, mindtmfduration)) {
+				f->frametype = AST_FRAME_NULL;
+				f->subclass_integer = 0;
+			} else if (f->subclass_integer == pvt->dtmf_digit &&
+					!ast_tvzero(pvt->dtmf_end_time) &&
+					ast_tvdiff_ms(ast_tvnow(), pvt->dtmf_end_time) <
+					CONF_SHARED(pvt, mindtmfinterval)) {
+				f->frametype = AST_FRAME_NULL;
+				f->subclass_integer = 0;
+			} else {
+				pvt->dtmf_digit = f->subclass_integer;
+				pvt->dtmf_end_time = ast_tvnow();
 			}
+			goto uac_return;
 		}
 	}
 
-	ast_mutex_unlock (&pvt->lock);
+	if (CONF_SHARED(pvt, rxgain) && f->frametype == AST_FRAME_VOICE &&
+			ast_frame_adjust_volume(f, CONF_SHARED(pvt, rxgain)) == -1)
+		ast_debug(1, "[%s] Volume could not be adjusted!\n", PVT_ID(pvt));
 
-	return &f;
+uac_return:
+	ast_mutex_unlock(&pvt->lock);
+	return f;
         }
 
 }
@@ -957,19 +998,6 @@ static int channel_write (struct ast_channel* channel, struct ast_frame* f)
 {
 	struct cpvt* cpvt = ast_channel_tech_pvt(channel);
 	struct pvt* pvt;
-#if ASTERISK_VERSION_NUM >= 130000 /* 13+ */
-	if (f->frametype != AST_FRAME_VOICE
-			|| ast_format_cmp(f->subclass.format, ast_format_slin) != AST_FORMAT_CMP_EQUAL)
-#elif ASTERISK_VERSION_NUM >= 100000 /* 10-13 */
-	if (f->frametype != AST_FRAME_VOICE
-			|| f->subclass.format.id != AST_FORMAT_SLINEAR)
-#else /* 10- */
-	if (f->frametype != AST_FRAME_VOICE
-			|| f->subclass_codec != AST_FORMAT_SLINEAR)
-#endif /* ^10- */
-	{
-		return 0;
-	}
 
 	if(!cpvt || cpvt->channel != channel || !cpvt->pvt)
 	{
@@ -985,9 +1013,21 @@ static int channel_write (struct ast_channel* channel, struct ast_frame* f)
 
 	pvt = cpvt->pvt;
 
+#if ASTERISK_VERSION_NUM >= 130000 /* 13+ */
+	if (f->frametype != AST_FRAME_VOICE ||
+			ast_format_cmp(f->subclass.format, pvt_ast_format(pvt)) != AST_FORMAT_CMP_EQUAL)
+#elif ASTERISK_VERSION_NUM >= 100000 /* 10-13 */
+	if (f->frametype != AST_FRAME_VOICE ||
+			f->subclass.format.id != pvt_ast_format(pvt)->id)
+#else /* 10- */
+	if (f->frametype != AST_FRAME_VOICE ||
+			f->subclass_codec != pvt_ast_format(pvt))
+#endif /* ^10- */
+		return 0;
+
 	ast_debug (7, "[%s] write call idx %d state %d\n", PVT_ID(pvt), cpvt->call_idx, cpvt->state);
 
-        if (strcmp(CONF_UNIQ(pvt, quec_uac),"1") != 0) {
+        if (!pvt_uses_uac(pvt)) {
 	size_t count;
 	int gains[2];
 
@@ -1131,55 +1171,71 @@ e_return:
 	ast_mutex_unlock (&pvt->lock);
 
 	return 0;
-             }
+        }
         else {
-	static char sizbuf[8000];
-	static int sizpos = 0;
-	int len = sizpos;
 	int res = 0;
-	/* size_t frames = 0; */
-	snd_pcm_state_t state;
-
+	size_t written_bytes;
 
 	while (ast_mutex_trylock (&pvt->lock))
 	{
 		CHANNEL_DEADLOCK_AVOIDANCE (channel);
 	}
-	if (f->datalen > sizeof(sizbuf) - sizpos) {
-		ast_log(LOG_WARNING, "Frame too large\n");
+
+	if (!CPVT_IS_ACTIVE(cpvt))
+		goto uac_write_return;
+
+	if (CONF_SHARED(pvt, txgain) && f->datalen &&
+			ast_frame_adjust_volume(f, CONF_SHARED(pvt, txgain)) == -1)
+		ast_debug(1, "[%s] Volume could not be adjusted!\n", PVT_ID(pvt));
+
+	if ((size_t) f->datalen > sizeof(pvt->uac_write_buf)) {
+		ast_log(LOG_ERROR, "[%s] UAC frame is too large: %d bytes\n",
+				PVT_ID(pvt), f->datalen);
 		res = -1;
-	} else {
-		memcpy(sizbuf + sizpos, f->data.ptr, f->datalen);
-		len += f->datalen;
-		state = snd_pcm_state(pvt->ocard);
-		if (state == SND_PCM_STATE_XRUN)
-			snd_pcm_prepare(pvt->ocard);
-		while ((res = snd_pcm_writei(pvt->ocard, sizbuf, len / 2)) == -EAGAIN) {
-			usleep(1);
-		}
-		if (res == -EPIPE) {
-#if DEBUG
-			ast_debug(1, "XRUN write\n");
-#endif
-			snd_pcm_prepare(pvt->ocard);
-			while ((res = snd_pcm_writei(pvt->ocard, sizbuf, len / 2)) == -EAGAIN) {
-				usleep(1);
-			}
-			if (res != len / 2) {
-				ast_log(LOG_ERROR, "Write error: %s\n", snd_strerror(res));
-				res = -1;
-			} else if (res < 0) {
-				ast_log(LOG_ERROR, "Write error %s\n", snd_strerror(res));
-				res = -1;
-			}
-		} else {
-			if (res == -ESTRPIPE)
-				ast_log(LOG_ERROR, "You've got some big problems\n");
-			else if (res < 0)
-				ast_log(LOG_NOTICE, "Error %d on write\n", res);
-		}
+		goto uac_write_return;
+	}
+	if ((size_t) f->datalen > sizeof(pvt->uac_write_buf) - pvt->uac_write_len) {
+		ast_log(LOG_WARNING, "[%s] UAC playback backlog overflow; dropping %zu stale bytes\n",
+				PVT_ID(pvt), pvt->uac_write_len);
+		pvt->uac_write_len = 0;
+		PVT_STAT(pvt, write_rb_overflow)++;
 	}
 
+	memcpy(pvt->uac_write_buf + pvt->uac_write_len,
+			f->data.ptr, f->datalen);
+	pvt->uac_write_len += f->datalen;
+	PVT_STAT(pvt, write_frames)++;
+
+	while (pvt->uac_write_len >= AUDIO_BYTES_PER_SAMPLE) {
+		res = snd_pcm_writei(pvt->ocard, pvt->uac_write_buf,
+				pvt->uac_write_len / AUDIO_BYTES_PER_SAMPLE);
+		if (res == -EAGAIN) {
+			res = 0;
+			break;
+		}
+		if (res < 0) {
+			int recover_res = snd_pcm_recover(pvt->ocard, res, 1);
+			if (recover_res < 0) {
+				ast_log(LOG_ERROR, "[%s] UAC write error: %s\n",
+						PVT_ID(pvt), snd_strerror(res));
+				res = recover_res;
+				break;
+			}
+			continue;
+		}
+		if (res == 0)
+			break;
+
+		written_bytes = (size_t) res * AUDIO_BYTES_PER_SAMPLE;
+		pvt->uac_write_len -= written_bytes;
+		PVT_STAT(pvt, a_write_bytes) += written_bytes;
+		if (pvt->uac_write_len)
+			memmove(pvt->uac_write_buf,
+					pvt->uac_write_buf + written_bytes,
+					pvt->uac_write_len);
+	}
+
+uac_write_return:
 	ast_mutex_unlock (&pvt->lock);
 
 	return res >= 0 ? 0 : res;
@@ -1454,6 +1510,9 @@ EXPORT_DEF struct ast_channel* new_channel(
 {
 	struct ast_channel* channel;
 	struct cpvt * cpvt;
+#if ASTERISK_VERSION_NUM >= 130000 /* 13+ */
+	struct ast_format_cap *native_cap;
+#endif
 
 	cpvt = cpvt_alloc(pvt, call_idx, dir, state);
 	if (cpvt)
@@ -1487,29 +1546,36 @@ EXPORT_DEF struct ast_channel* new_channel(
 			ast_channel_tech_set(channel, &channel_tech);
 
 #if ASTERISK_VERSION_NUM >= 130000 /* 13+ */
-			ast_channel_nativeformats_set(channel, channel_tech.capabilities);
-			ast_channel_set_rawreadformat(channel, ast_format_slin);
-			ast_channel_set_rawwriteformat(channel, ast_format_slin);
-			ast_channel_set_writeformat(channel, ast_format_slin);
-			ast_channel_set_readformat(channel, ast_format_slin);
+			native_cap = ast_format_cap_alloc(AST_FORMAT_CAP_FLAG_DEFAULT);
+			if (native_cap) {
+				ast_format_cap_append(native_cap, pvt_ast_format(pvt), 0);
+				ast_channel_nativeformats_set(channel, native_cap);
+				ao2_cleanup(native_cap);
+			} else {
+				ast_channel_nativeformats_set(channel, channel_tech.capabilities);
+			}
+			ast_channel_set_rawreadformat(channel, pvt_ast_format(pvt));
+			ast_channel_set_rawwriteformat(channel, pvt_ast_format(pvt));
+			ast_channel_set_writeformat(channel, pvt_ast_format(pvt));
+			ast_channel_set_readformat(channel, pvt_ast_format(pvt));
 #elif ASTERISK_VERSION_NUM >= 110000 /* 11+ */
-		        ast_format_cap_add(ast_channel_nativeformats(channel), &chan_quectel_format);
-		        ast_format_copy(ast_channel_rawreadformat(channel), &chan_quectel_format);
-		        ast_format_copy(ast_channel_rawwriteformat(channel), &chan_quectel_format);
-		        ast_format_copy(ast_channel_writeformat(channel), &chan_quectel_format);
-		        ast_format_copy(ast_channel_readformat(channel), &chan_quectel_format);
+		        ast_format_cap_add(ast_channel_nativeformats(channel), pvt_ast_format(pvt));
+		        ast_format_copy(ast_channel_rawreadformat(channel), pvt_ast_format(pvt));
+		        ast_format_copy(ast_channel_rawwriteformat(channel), pvt_ast_format(pvt));
+		        ast_format_copy(ast_channel_writeformat(channel), pvt_ast_format(pvt));
+		        ast_format_copy(ast_channel_readformat(channel), pvt_ast_format(pvt));
 #elif ASTERISK_VERSION_NUM >= 100000 /* 10+ */
-		        ast_format_cap_add(channel->nativeformats, &chan_quectel_format);
-		        ast_format_copy(&channel->rawreadformat, &chan_quectel_format);
-		        ast_format_copy(&channel->rawwriteformat, &chan_quectel_format);
-		        ast_format_copy(&channel->writeformat, &chan_quectel_format);
-		        ast_format_copy(&channel->readformat, &chan_quectel_format);
+		        ast_format_cap_add(channel->nativeformats, pvt_ast_format(pvt));
+		        ast_format_copy(&channel->rawreadformat, pvt_ast_format(pvt));
+		        ast_format_copy(&channel->rawwriteformat, pvt_ast_format(pvt));
+		        ast_format_copy(&channel->writeformat, pvt_ast_format(pvt));
+		        ast_format_copy(&channel->readformat, pvt_ast_format(pvt));
 #else /* 10- */
-			channel->nativeformats	= AST_FORMAT_SLINEAR;
-			channel->rawreadformat	= AST_FORMAT_SLINEAR;
-			channel->rawwriteformat	= AST_FORMAT_SLINEAR;
-			channel->readformat	= AST_FORMAT_SLINEAR;
-			channel->writeformat	= AST_FORMAT_SLINEAR;
+			channel->nativeformats	= pvt_ast_format(pvt);
+			channel->rawreadformat	= pvt_ast_format(pvt);
+			channel->rawwriteformat	= pvt_ast_format(pvt);
+			channel->readformat	= pvt_ast_format(pvt);
+			channel->writeformat	= pvt_ast_format(pvt);
 #endif /* ^10- */
 
 			if (ast_state == AST_STATE_RING)
@@ -1761,7 +1827,7 @@ static int channel_func_write(struct ast_channel* channel, const char* function,
 
 			if((dc_dtmf_setting_t)val != pvt->real_dtmf)
 			{
-				pvt_dsp_setup(pvt, PVT_ID(pvt), val);
+				pvt_dsp_setup(pvt, PVT_ID(pvt), val, pvt_audio_rate(pvt));
 			}
 
 			ast_mutex_unlock(&cpvt->pvt->lock);
@@ -1783,7 +1849,7 @@ EXPORT_DEF struct ast_channel_tech channel_tech =
 	.type			= "Quectel",
 	.description		= MODULE_DESCRIPTION,
 #if ASTERISK_VERSION_NUM < 100000 /* 10- */
-	.capabilities		= AST_FORMAT_SLINEAR,
+	.capabilities		= AST_FORMAT_SLINEAR | AST_FORMAT_SLINEAR16,
 #endif /* ^10- */
 	.requester		= channel_request,
 	.call			= channel_call,
