@@ -702,6 +702,27 @@ static void *do_monitor_phone(void *data) {
       ast_mutex_lock(&pvt->lock);
       ecmd = at_queue_head_cmd(pvt);
       if (ecmd) {
+        /* Another thread (e.g. DTMF from the channel) may have queued and
+         * written this command after 't' was computed, so the wait that just
+         * expired was the idle timeout, not this command's own deadline.
+         * Only treat the command as timed out once its deadline has passed. */
+        int remaining = at_queue_timeout(pvt);
+        if (ecmd->length > 0) {
+          /* not written yet: try to write it and keep waiting */
+          if (at_queue_run(pvt)) {
+            goto e_cleanup;
+          }
+          ast_mutex_unlock(&pvt->lock);
+          continue;
+        }
+        if (remaining > 0) {
+          ast_debug(2,
+                    "[%s] wait expired but '%s' still has %d ms before "
+                    "timeout, keep waiting\n",
+                    dev, at_cmd2str(ecmd->cmd), remaining);
+          ast_mutex_unlock(&pvt->lock);
+          continue;
+        }
         ast_log(LOG_ERROR,
                 "[%s] timedout while waiting '%s' in response to '%s'\n", dev,
                 at_res2str(ecmd->res), at_cmd2str(ecmd->cmd));
