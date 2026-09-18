@@ -431,6 +431,15 @@ static void disactivate_call(struct cpvt* cpvt)
 					pvt->uac_read_pos = 0;
 					pvt->uac_read_left = pvt_audio_frame_samples(pvt);
 					pvt->uac_write_len = 0;
+					/*
+					 * Quectel requires UAC voice to be disabled after a call.
+					 * Leaving QPCMV enabled can make later calls exchange PCM
+					 * frames containing only silence.
+					 */
+					if (cpvt->state != CALL_STATE_ONHOLD &&
+						at_enqueue_user_cmd(cpvt, "AT+QPCMV=0"))
+						ast_log(LOG_ERROR, "[%s] Error disabling UAC voice after call\n",
+							PVT_ID(pvt));
 				}
 		else mixb_detach(&cpvt->pvt->a_write_mixb, &cpvt->mixstream);
 		ast_channel_set_fd (cpvt->channel, 1, -1);
