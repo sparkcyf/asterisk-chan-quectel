@@ -422,6 +422,11 @@ EXPORT_DEF int at_parse_cmgr(char *str, size_t len, int *tpdu_type, char *sca, s
 			/* tpdu_parse_deliver sets chan_quectel_err */
 			return -1;
 		}
+		if (udh->payload_type != PDU_PAYLOAD_TEXT) {
+			*msg_len = 0;
+			msg[0] = '\0';
+			break;
+		}
 		res = ucs2_to_utf8(msg16_tmp, res, msg, *msg_len);
 		if (res < 0) {
 			chan_quectel_err = E_PARSE_UCS2;

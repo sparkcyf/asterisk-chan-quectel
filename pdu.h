@@ -24,11 +24,22 @@
 #define TPDU_LENGTH 176
 #define PDU_LENGTH 256
 
+typedef enum pdu_payload_type
+{
+	PDU_PAYLOAD_TEXT = 0,
+	PDU_PAYLOAD_BINARY,
+	PDU_PAYLOAD_MMS
+} pdu_payload_type_t;
+
 typedef struct pdu_udh
 {
 	uint8_t ref;
 	uint8_t parts, order;
 	uint8_t ls, ss;
+	pdu_payload_type_t payload_type;
+	uint16_t destination_port, source_port;
+	int has_ports;
+	size_t payload_length;
 } pdu_udh_t;
 
 typedef struct pdu_part

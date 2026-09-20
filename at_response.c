@@ -1528,6 +1528,7 @@ static int at_response_cmgr(struct pvt *pvt, const char *str, size_t len) {
   char payload[SMSDB_PAYLOAD_MAX_LEN];
   ssize_t payload_len;
   int status_report[256];
+  int delete_binary_sms = 0;
 
   const struct at_queue_cmd *ecmd = at_queue_head_cmd(pvt);
 
@@ -1582,6 +1583,31 @@ static int at_response_cmgr(struct pvt *pvt, const char *str, size_t len) {
         break;
       case PDUTYPE_MTI_SMS_DELIVER:
         ast_debug(1, "[%s] Successfully read SM\n", PVT_ID(pvt));
+        if (udh.payload_type != PDU_PAYLOAD_TEXT) {
+          delete_binary_sms = 1;
+          if (udh.payload_type == PDU_PAYLOAD_MMS) {
+            ast_log(LOG_NOTICE,
+                    "[%s] Received MMS WAP Push as binary SMS from %s at %s "
+                    "(destination port %u, source port %u, payload %zu "
+                    "bytes); deleting stored SMS without downloading MMS\n",
+                    PVT_ID(pvt), oa, scts, udh.destination_port,
+                    udh.source_port, udh.payload_length);
+          } else if (udh.has_ports) {
+            ast_log(LOG_NOTICE,
+                    "[%s] Received non-MMS binary SMS from %s at %s "
+                    "(destination port %u, source port %u, payload %zu "
+                    "bytes); deleting stored SMS without forwarding it\n",
+                    PVT_ID(pvt), oa, scts, udh.destination_port,
+                    udh.source_port, udh.payload_length);
+          } else {
+            ast_log(LOG_NOTICE,
+                    "[%s] Received non-MMS binary SMS from %s at %s "
+                    "(%zu payload bytes, no application ports); deleting "
+                    "stored SMS without forwarding it\n",
+                    PVT_ID(pvt), oa, scts, udh.payload_length);
+          }
+          break;
+        }
         /* Queue SMS for asynchronous processing to avoid blocking voice calls
          */
         ast_verb(
@@ -1603,7 +1629,8 @@ static int at_response_cmgr(struct pvt *pvt, const char *str, size_t len) {
               PVT_ID(pvt), at_res2str(ecmd->res), at_cmd2str(ecmd->cmd));
     }
   receive_next:
-    if (CONF_SHARED(pvt, autodeletesms) && pvt->incoming_sms_index != -1U) {
+    if ((delete_binary_sms || CONF_SHARED(pvt, autodeletesms)) &&
+        pvt->incoming_sms_index != -1U) {
       at_enqueue_delete_sms(&pvt->sys_chan, pvt->incoming_sms_index);
     }
   receive_next_no_delete:
