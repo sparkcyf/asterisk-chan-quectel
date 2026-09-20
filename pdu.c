@@ -267,6 +267,11 @@
 #define CSMS_UCS2_MAX_LEN 67
 #define SMS_UCS2_MAX_LEN 70
 
+#define WAP_PUSH_PORT 2948
+#define WSP_PDU_PUSH 0x06
+#define WSP_PDU_CONFIRMED_PUSH 0x07
+#define WSP_CONTENT_TYPE_MMS 0x3e
+
 EXPORT_DEF void pdu_udh_init(pdu_udh_t *udh)
 {
 	udh->ref = 0;
@@ -274,6 +279,110 @@ EXPORT_DEF void pdu_udh_init(pdu_udh_t *udh)
 	udh->order = 0;
 	udh->ss = 0;
 	udh->ls = 0;
+	udh->payload_type = PDU_PAYLOAD_TEXT;
+	udh->destination_port = 0;
+	udh->source_port = 0;
+	udh->has_ports = 0;
+	udh->payload_length = 0;
+}
+
+/* Decode a WSP uintvar. Return 0 for malformed or overlong values. */
+static int wsp_decode_uintvar(const uint8_t *data, size_t length,
+	size_t *value, size_t *consumed)
+{
+	size_t result = 0;
+	size_t i;
+
+	for (i = 0; i < length && i < 5; ++i) {
+		if (result > (((size_t)-1) >> 7)) {
+			return 0;
+		}
+		result = (result << 7) | (data[i] & 0x7f);
+		if (!(data[i] & 0x80)) {
+			*value = result;
+			*consumed = i + 1;
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static int wsp_is_mms_media_type(const uint8_t *data, size_t length)
+{
+	static const char mms_type[] = "application/vnd.wap.mms-message";
+	size_t i = 0;
+
+	if (!length) {
+		return 0;
+	}
+
+	/* A short-integer has bit 7 set and stores the value in bits 6..0. */
+	if (data[0] & 0x80) {
+		return (data[0] & 0x7f) == WSP_CONTENT_TYPE_MMS;
+	}
+
+	/* 0x7f is the quote octet for an extension-media text string. */
+	if (data[0] == 0x7f) {
+		i = 1;
+	}
+	if (length - i < sizeof(mms_type)) {
+		return 0;
+	}
+
+	return !memcmp(data + i, mms_type, sizeof(mms_type) - 1) &&
+		data[i + sizeof(mms_type) - 1] == '\0';
+}
+
+static int wsp_is_mms_content_type(const uint8_t *data, size_t length)
+{
+	size_t value_length, length_length;
+	size_t offset;
+
+	if (!length) {
+		return 0;
+	}
+
+	/* Content-general-form starts with Value-length. */
+	if (data[0] <= 30) {
+		value_length = data[0];
+		offset = 1;
+	} else if (data[0] == 31) {
+		if (!wsp_decode_uintvar(data + 1, length - 1,
+			&value_length, &length_length)) {
+			return 0;
+		}
+		offset = 1 + length_length;
+	} else {
+		return wsp_is_mms_media_type(data, length);
+	}
+
+	if (value_length > length - offset) {
+		return 0;
+	}
+	return wsp_is_mms_media_type(data + offset, value_length);
+}
+
+static int pdu_is_mms_wap_push(const uint8_t *data, size_t length)
+{
+	size_t headers_length, length_length;
+	size_t headers_offset;
+
+	/* Transaction-ID, PDU-Type, HeadersLen, Content-Type. */
+	if (length < 4 ||
+		(data[1] != WSP_PDU_PUSH && data[1] != WSP_PDU_CONFIRMED_PUSH)) {
+		return 0;
+	}
+	if (!wsp_decode_uintvar(data + 2, length - 2,
+		&headers_length, &length_length)) {
+		return 0;
+	}
+	headers_offset = 2 + length_length;
+	if (!headers_length || headers_length > length - headers_offset) {
+		return 0;
+	}
+
+	return wsp_is_mms_content_type(data + headers_offset, headers_length);
 }
 
 #/* get digit code, 0 if invalid  */
@@ -814,13 +923,6 @@ EXPORT_DEF int tpdu_parse_deliver(uint8_t *pdu, size_t pdu_length, int tpdu_type
 			return -1;
 		}
 	}
-	if (alphabet == PDU_DCS_ALPHABET_8BIT) {
-		// TODO: What to do with binary messages? Are there any?
-		// Return an error as it is dangerous to forward the raw binary data as text
-		chan_quectel_err = E_INVALID_CHARSET;
-		return -1;
-	}
-
 	/* calculate number of octets in UD */
 	int udl_nibbles;
 	int udl_bytes = udl;
@@ -887,6 +989,28 @@ EXPORT_DEF int tpdu_parse_deliver(uint8_t *pdu, size_t pdu_length, int tpdu_type
 					udh->order = pdu[i++];
 					udhl -= 4;
 					break;
+				case 0x04: /* Application port addressing, 8 bit */
+					if (iei_len != 2) {
+						chan_quectel_err = E_UNKNOWN;
+						return -1;
+					}
+					udh->destination_port = pdu[i++];
+					udh->source_port = pdu[i++];
+					udh->has_ports = 1;
+					udhl -= 2;
+					break;
+				case 0x05: /* Application port addressing, 16 bit */
+					if (iei_len != 4) {
+						chan_quectel_err = E_UNKNOWN;
+						return -1;
+					}
+					udh->destination_port = (pdu[i++] << 8);
+					udh->destination_port |= pdu[i++];
+					udh->source_port = (pdu[i++] << 8);
+					udh->source_port |= pdu[i++];
+					udh->has_ports = 1;
+					udhl -= 4;
+					break;
 				case 0x24: /* National Language Single Shift */
 					if (iei_len != 1) {
 						chan_quectel_err = E_UNKNOWN;
@@ -917,6 +1041,16 @@ EXPORT_DEF int tpdu_parse_deliver(uint8_t *pdu, size_t pdu_length, int tpdu_type
 	}
 
 	int msg_len = pdu_length - i, out_len;
+	udh->payload_length = msg_len;
+	if (alphabet == PDU_DCS_ALPHABET_8BIT) {
+		udh->payload_type = PDU_PAYLOAD_BINARY;
+		if (udh->has_ports && udh->destination_port == WAP_PUSH_PORT &&
+			pdu_is_mms_wap_push(pdu + i, msg_len)) {
+			udh->payload_type = PDU_PAYLOAD_MMS;
+		}
+		msg[0] = '\0';
+		return 0;
+	}
 	if (alphabet == PDU_DCS_ALPHABET_7BIT) {
 		out_len = gsm7_unpack_decode(pdu + i, udl_nibbles, msg, 1024 /* assume enough memory, as SMS messages are limited in size */, msg_padding, udh->ls, udh->ss);
 		if (out_len < 0) {

@@ -305,6 +305,8 @@ void test_parse_cmgr()
 		int failidx = 0;
 		result.str = input = strdup(cases[idx].input);
 		result.msg_utf8 = buf;
+		result.msg_len = sizeof(buf);
+		pdu_udh_init(&result.udh);
 
 		fprintf(stderr, "/* %u */ %s(\"%s\")...", idx, "at_parse_cmgr", input);
 		result.res = at_parse_cmgr(
@@ -325,6 +327,79 @@ void test_parse_cmgr()
 		fprintf(stderr, " = '%s' ('%s','%s') [fail@%d]\n[text=%s] %s\n",
 			result.res, result.oa,
 			result.msg, failidx, result.msg_utf8, msg);
+		free(input);
+	}
+	fprintf(stderr, "\n");
+}
+
+void test_parse_binary_cmgr()
+{
+	static const struct test_case {
+		const char *input;
+		pdu_payload_type_t payload_type;
+		int has_ports;
+		unsigned destination_port;
+		unsigned source_port;
+		size_t payload_length;
+	} cases[] = {
+		{
+			/* MMS WAP Push with the literal content type used by the EC20 sample. */
+			"+CMGR: 0,,61\r\n"
+			"07913306000000F040048121430004610110129392802E0605040B8423F40006226170706C69636174696F6E2F766E642E7761702E6D6D732D6D65737361676500AF848C82",
+			PDU_PAYLOAD_MMS, 1, 2948, 9204, 39
+		},
+		{
+			/* MMS WAP Push using the registered short content-type value 0x3e. */
+			"+CMGR: 0,,28\r\n"
+			"07913306000000F040048121430004610110129392800D0605040B8423F4010601BE8C82",
+			PDU_PAYLOAD_MMS, 1, 2948, 9204, 6
+		},
+		{
+			/* Port 2948 alone is insufficient to classify data as MMS. */
+			"+CMGR: 0,,26\r\n"
+			"07913306000000F040048121430004610110129392800B0605040B8423F4DEADBEEF",
+			PDU_PAYLOAD_BINARY, 1, 2948, 9204, 4
+		},
+		{
+			"+CMGR: 0,,19\r\n"
+			"07913306000000F0000481214300046101101293928004DEADBEEF",
+			PDU_PAYLOAD_BINARY, 0, 0, 0, 4
+		},
+	};
+	unsigned idx;
+
+	for (idx = 0; idx < ITEMS_OF(cases); ++idx) {
+		char *input = strdup(cases[idx].input);
+		char sca[64], oa[64], scts[64], dt[64], msg[256];
+		size_t msg_len = sizeof(msg);
+		int tpdu_type, mr, st;
+		pdu_udh_t udh;
+		int res;
+		const char *status;
+
+		pdu_udh_init(&udh);
+		res = at_parse_cmgr(input, strlen(input), &tpdu_type,
+			sca, sizeof(sca), oa, sizeof(oa), scts, &mr, &st, dt,
+			msg, &msg_len, &udh);
+		if (res == 0 && PDUTYPE_MTI(tpdu_type) == PDUTYPE_MTI_SMS_DELIVER &&
+			udh.payload_type == cases[idx].payload_type &&
+			udh.has_ports == cases[idx].has_ports &&
+			udh.destination_port == cases[idx].destination_port &&
+			udh.source_port == cases[idx].source_port &&
+			udh.payload_length == cases[idx].payload_length &&
+			msg_len == 0 && msg[0] == '\0') {
+			status = "OK";
+			++ok;
+		} else {
+			status = "FAIL";
+			++faults;
+		}
+		fprintf(stderr,
+			"at_parse_cmgr(binary %u) = %d type=%d ports=%d/%u/%u "
+			"payload=%zu %s\n",
+			idx, res, udh.payload_type, udh.has_ports,
+			udh.destination_port, udh.source_port,
+			udh.payload_length, status);
 		free(input);
 	}
 	fprintf(stderr, "\n");
@@ -468,6 +543,7 @@ int main()
 	test_parse_creg();
 	test_parse_cmti();
 	test_parse_cmgr();
+	test_parse_binary_cmgr();
 	test_parse_cusd();
 	test_parse_cpin();
 	test_parse_csq();
